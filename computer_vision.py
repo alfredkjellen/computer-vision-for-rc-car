@@ -4,9 +4,10 @@ import json
 import os
 import math
 import pandas as pd
+import time
 
 class CarDetector:
-    def __init__(self, video_file=None, debug=False):
+    def __init__(self, video_file=None, competitor_name='Player', flipped=True):
         if video_file is not None:
             self.video_file = video_file
             self.video_source = os.path.join("recordings", self.video_file)
@@ -15,6 +16,9 @@ class CarDetector:
             self.video_file = 'live_feed'
             self.cap = cv2.VideoCapture(0)
         
+        self.competitor_name = competitor_name
+        self.flipped = flipped
+
         self.save_file = "videos.json"
 
         if not self.cap.isOpened():
@@ -25,18 +29,38 @@ class CarDetector:
 
         self.angle = 90
         self.position = None
-        self.scale_factor = None
-        self.obstacles = []
+
+        self.corners = None
+        self.obstacles = None
+        self.finish_line = None
 
         self.pixels_per_square = 150
         self.horizontal_squares = 3
         self.vertical_squares = 4
         self.width = self.pixels_per_square * self.horizontal_squares
         self.height = self.pixels_per_square * self.vertical_squares
-        ###self.object_detector = cv2.createBackgroundSubtractorMOG2(history=1000, varThreshold=20) ###
+
+        self.centimeters_per_square = 50
+        self.scale_factor = self.pixels_per_square / self.centimeters_per_square 
+
+        self.started = False
+        self.finished = False
+
+    def read_capture(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        frame = cv2.flip(frame, -1) if self.flipped else frame
+        return frame
 
     def pressed(self, key):
         return cv2.waitKey(10) & 0xFF == ord(key)
+    
+    def put_text(self, frame, text, line=0):
+        x = 5
+        y = (line + 1) * 15
+        cv2.putText(frame, text, (x,y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,0), 1, cv2.LINE_AA)
+
 
     def load_json(self, video_name, file_name):
         if os.path.exists(file_name):
@@ -46,12 +70,12 @@ class CarDetector:
         else:
             return None
 
-
-    def select_corners(self, filename=None):
+    def select_corners(self):
         corners = []
         while True:
-            ret, frame = self.cap.read()
-            if not ret:
+            #ret, frame = self.cap.read()
+            frame = self.read_capture()
+            if frame is None:
                 print("Could not read frame")
                 self.cap.release()
                 cv2.destroyAllWindows()
@@ -61,7 +85,7 @@ class CarDetector:
             cv2.setMouseCallback("Select Corners", self.select_points, corners)
 
             print("Click to select corners.")
-            print("Press 'n' to skip to the next frame if the corners are not visible.")
+            print("Press 'n' to skip to the next frame if the corners aren't visible.")
 
             while len(corners) < 4:
                 cv2.imshow("Select Corners", frame)
@@ -76,24 +100,24 @@ class CarDetector:
 
             if len(corners) == 4:
                 cv2.destroyWindow("Select Corners")
-                return corners                               
+                self.corners = corners
+                return                                
 
 
-    def calibrate_scale(self, real_distance_cm, corners):
+    def calibrate_scale(self, real_distance_cm):
         while True:
-            ret, frame = self.cap.read()
-            warped = self.perspective_transform(frame, corners)
-            cv2.imshow("Calibrate Scale", warped)
+            frame = self.get_transformed_frame()
+            cv2.imshow("Calibrate Scale", frame)
             points = []
 
             def on_mouse(event, x, y, flags, param):
                 if event == cv2.EVENT_LBUTTONDOWN:
                     points.append((x, y))
-                    cv2.circle(warped, (x, y), 5, (0, 255, 0), -1)
-                    cv2.imshow("Calibrate Scale", warped)
+                    cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+                    cv2.imshow("Calibrate Scale", frame)
                     if len(points) == 2:
-                        cv2.line(warped, points[0], points[1], (255, 0, 0), 2)
-                        cv2.imshow("Calibrate Scale", warped)
+                        cv2.line(frame, points[0], points[1], (255, 0, 0), 2)
+                        cv2.imshow("Calibrate Scale", frame)
 
             cv2.setMouseCallback("Calibrate Scale", on_mouse)
             
@@ -126,9 +150,8 @@ class CarDetector:
         df.to_csv(filename, index=False)
         print(f"Data saved to {filename}")
 
-    def save_video_data(self, corners=None, obstacles=None, scale_factor=None):
+    def save_video_data(self):
         json_path = self.save_file
-        
         try:
             if os.path.exists(json_path):
                 with open(json_path, 'r') as json_file:
@@ -139,14 +162,17 @@ class CarDetector:
             video_data = {}
         
         video_entry = {}
-        if corners is not None:
-            video_entry['corners'] = corners
+        if self.corners is not None:
+            video_entry['corners'] = self.corners
         
-        if obstacles is not None:
-            video_entry['obstacles'] = obstacles
+        if self.obstacles is not None:
+            video_entry['obstacles'] = [obstacle.tolist() for obstacle in self.obstacles]
         
-        if scale_factor is not None:
-            video_entry['scale_factor'] = scale_factor
+        if self.scale_factor is not None:
+            video_entry['scale_factor'] = self.scale_factor
+
+        if self.finish_line is not None:
+            video_entry['finish_line'] = self.finish_line.tolist()
         
         video_data[self.video_file] = video_entry
         
@@ -159,70 +185,69 @@ class CarDetector:
     
     def load_video_data(self):
         json_path = self.save_file        
-        corners = None
-        obstacles = None
-        scale_factor = None        
         try:
             if not os.path.exists(json_path):
                 print(f"No save file found at {json_path}")
-                return corners, obstacles, scale_factor
+                return False
             
             with open(json_path, 'r') as json_file:
                 video_data = json.load(json_file)
-            
+                        
             if self.video_file not in video_data:
                 print(f"No data found for video {self.video_file}")
-                return corners, obstacles, scale_factor
+                return False
             
             video_entry = video_data[self.video_file]
             
-            corners = video_entry.get('corners', None)
-            obstacles = video_entry.get('obstacles', None)
-            scale_factor = video_entry.get('scale_factor', None)
-            
-            if obstacles is not None:
-                obstacles = [np.array(obstacle, dtype=float) for obstacle in obstacles]
-                self.obstacles = obstacles
-            
-            if scale_factor is not None:
-                self.scale_factor = scale_factor
+            self.corners = video_entry.get('corners', None)
 
-            return corners, obstacles, scale_factor
+            obstacles = video_entry.get('obstacles', None)
+            self.obstacles = [np.array(obstacle, dtype=float) for obstacle in obstacles] if obstacles is not None else None
+            
+            self.scale_factor = video_entry.get('scale_factor', None)
+            
+            finish_line = video_entry.get('finish_line', None)
+            self.finish_line = np.array(finish_line) if finish_line is not None else None
+            
+            return all(item is not None for item in [self.corners, self.obstacles, self.scale_factor, self.finish_line])
         
         except json.JSONDecodeError:
             print(f"Error decoding JSON from {json_path}")
-            return corners, obstacles, scale_factor
+            return False
         except Exception as e:
             print(f"Unexpected error loading video data: {e}")
-            return corners, obstacles, scale_factor
+            return False
 
-    def select_obstacles(self, corners):
+    def select_obstacles(self):
             obstacles = []
             points = []
+            text = "Select corners for each obstacle."
+
             while True:
-                ret, frame = self.cap.read()
-                warped = self.perspective_transform(frame, corners)
-                cv2.imshow("Select Obstacles", warped)                
+                frame = self.get_transformed_frame()
+                
+                self.put_text(frame, text)
+                cv2.imshow("Select Obstacles", frame)
 
                 def on_mouse(event, x, y, flags, param):
-                    frame = warped
+                    debug_frame = frame.copy()
 
                     if event == cv2.EVENT_LBUTTONDOWN:
                         points.append((x, y))
-                        cv2.circle(frame, (x, y), 4, (0, 255, 0), -1)
+                        cv2.circle(debug_frame, (x, y), 4, (0, 255, 0), -1)
 
                     points_len = len(points)
                     for i in range(points_len):
                         if i != points_len - 1:
-                            cv2.line(frame, points[i], points[(i+1) % points_len], (255, 0,0 ), 2)
+                            cv2.line(debug_frame, points[i], points[(i+1) % points_len], (255, 0,0 ), 2)
 
                     for obstacle in obstacles:
                         obstacle_len = len(obstacle)
                         for i in range(obstacle_len):
-                            cv2.line(frame, obstacle[i], obstacle[(i+1) % obstacle_len], (255, 0,0 ), 2)
-                                            
-                    cv2.imshow("Select Obstacles", frame)
-            
+                            cv2.line(debug_frame, obstacle[i], obstacle[(i+1) % obstacle_len], (255, 0,0 ), 2)
+                        
+                    cv2.imshow("Select Obstacles", debug_frame)
+
                 cv2.setMouseCallback("Select Obstacles", on_mouse)
                 
                 while True:
@@ -237,15 +262,56 @@ class CarDetector:
                         break
                     if self.pressed('\r'):
                         cv2.destroyWindow("Select Obstacles")
-                        obstacle_list = obstacles.copy()
                         obstacles = [np.array(obstacle, dtype=float) for obstacle in obstacles]
                         self.obstacles = obstacles
-                        return obstacles, obstacle_list
+                        return obstacles
+
+    def select_finish_line(self):
+        points = []
+        text = "Select 2 points for the finish line. "
+
+        while True:
+            #ret, frame = self.cap.read()
+            frame = self.read_capture()
+
+            frame = self.perspective_transform(frame)
+            window_name = "Select finish line"
+            self.put_text(frame, text)
+            cv2.imshow(window_name, frame)
+    
+            def on_mouse(event, x, y, flags, param):
+                debug_frame = frame.copy()
+                                
+                if len(points) < 2:
+                    if event == cv2.EVENT_LBUTTONDOWN:
+                            points.append((x, y))
+                            
+                for point in points:
+                    cv2.circle(debug_frame, point, 4, (0, 255, 0), -1)
+
+                if len(points) == 2:
+                            cv2.line(debug_frame, points[0], points[1], (255, 0,0 ), 2)
+
+                cv2.imshow(window_name, debug_frame)
+               
+            cv2.setMouseCallback(window_name, on_mouse)
+
+            while True:                    
+                if self.pressed('n'):
+                    break
+                
+                if self.pressed('r'):
+                    points = []
+
+                if self.pressed('\r'):
+                    if len(points) == 2:
+                        cv2.destroyWindow(window_name)
+                        finish_line = np.array(points)
+                        self.finish_line = finish_line
+                        return finish_line
                     
-                    
-                    
-    def perspective_transform(self, frame, corners, debug=False):
-        corners = np.array(corners, dtype=np.float32)
+    def perspective_transform(self, frame, debug=False):
+        corners = np.array(self.corners, dtype=np.float32)
         top_left = corners[np.argmin(corners.sum(axis=1))]      
         top_right = corners[np.argmax(corners[:, 0] - corners[:, 1])]
         bottom_right = corners[np.argmax(corners.sum(axis=1))]
@@ -270,15 +336,11 @@ class CarDetector:
             for point in src_points:
                 cv2.circle(debug_frame, tuple(point.astype(int)), 5, (0, 255, 0), -1)
             cv2.imshow("Warp debug", debug_frame)
- 
-        try:
-            matrix = cv2.getPerspectiveTransform(src_points, dst_points)
-            warped = cv2.warpPerspective(frame, matrix, (self.width, self.height))
-            return warped
-        except cv2.error as e:
-            print(f"Error in perspective transform: {e}")
-            return None
 
+        matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+        warped = cv2.warpPerspective(frame, matrix, (self.width, self.height))
+        return warped
+    
     def get_points_and_polygon(self, contours, car_mask):
         largest_contour = max(contours, key=cv2.contourArea)    
         epsilon = 0.10 * cv2.arcLength(largest_contour, True)
@@ -286,14 +348,17 @@ class CarDetector:
         points = polygon.reshape(-1, 2)
         return points, polygon
         
-    def create_history_mask(self, frame, history, debug_frame, window_size=60):
+    def create_history_mask(self, frame, history, window_size=60):
         if len(history) < 100: ###
-            return frame, debug_frame
+            return frame
         
         if history.positions[-1] is None:
             window_size = 1000 ###
         
         current_pos = history.get_latest_position()
+        if current_pos is None:
+            return frame
+
         p1 = np.array([current_pos[0] - window_size, current_pos[1] - window_size])
         p2 = np.array([current_pos[0] + window_size, current_pos[1] - window_size])
         p3 = np.array([current_pos[0] + window_size, current_pos[1] + window_size])
@@ -305,8 +370,8 @@ class CarDetector:
         result = cv2.bitwise_and(frame, history_mask)
         cv2.imshow("history result", result)
         
-        cv2.polylines(debug_frame, [points], isClosed=True, color=(0, 255, 0), thickness=2)
-        return result, debug_frame
+        cv2.polylines(self.debug_frame, [points], isClosed=True, color=(0, 255, 0), thickness=2)
+        return result
     
 
     def calculate_distance(self, p1, p2):
@@ -342,17 +407,17 @@ class CarDetector:
 
 
 
-    def find_corners_with_polygon(self, mask, debug_frame):
+    def find_corners_with_polygon(self, mask):
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours is None or len(contours) == 0:
-            return None, debug_frame
+            return None
         
         largest_contour = max(contours, key=cv2.contourArea)
         epsilon = 0.10 * cv2.arcLength(largest_contour, True)
         polygon = cv2.approxPolyDP(largest_contour, epsilon, True)
         corners = polygon.reshape(-1, 2)
-        cv2.polylines(debug_frame, polygon, True, (255, 0, 0), thickness=2)
-        return corners, debug_frame
+        cv2.polylines(self.debug_frame, polygon, True, (255, 0, 0), thickness=2)
+        return corners
 
     def calculate_center(self, points):
         if len(points) == 0:
@@ -363,34 +428,34 @@ class CarDetector:
         return center
 
     
-    def detect_color(self, frame, scale_factor, obstacles, history):
-        debug_frame = frame
+    def color_detection(self, frame, history):
+        self.debug_frame = frame.copy()
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         car_mask = cv2.inRange(hsv, *self.color_ranges['car_full'])
-        car_mask, debug_frame = self.create_history_mask(car_mask, history, debug_frame)
+        car_mask = self.create_history_mask(car_mask, history)
 
         center, angle = None, None
 
-        for obstacle in obstacles:
+        for obstacle in self.obstacles:
             obstacle = np.array(obstacle, dtype=np.int32)
             cv2.fillPoly(car_mask, [obstacle], 0)
 
-        corners, debug_frame = self.find_corners_with_polygon(car_mask, debug_frame)
+        corners = self.find_corners_with_polygon(car_mask)
         if corners is None:
-            return center, angle, debug_frame
+            return center, angle
         
         center = self.calculate_center(corners)
         if center is None or len(corners) != 4:
-            return center, angle, debug_frame
+            return center, angle
     
         angle = self.determine_angle(corners, center, history)
         if angle is None:
-            return center, angle, debug_frame
+            return center, angle
         
 
         center_int = (int(center[0]), int(center[1]))
-        cv2.circle(debug_frame, center_int, 3, (255, 0, 0), -1)
-        cv2.putText(debug_frame,f"({center[0]:.0f}, {center[1]:.0f}) {angle:.0f} deg",(center_int[0] + 50, center_int[1] + 50),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255, 0, 0),1,cv2.LINE_AA)
+        cv2.circle(self.debug_frame, center_int, 3, (255, 0, 0), -1)
+        cv2.putText(self.debug_frame,f"({center[0]:.0f}, {center[1]:.0f}) {angle:.0f} deg",(center_int[0] + 50, center_int[1] + 50),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255, 0, 0),1,cv2.LINE_AA)
         
         arrow_length = 50
         angle_rad = math.radians(angle)
@@ -399,85 +464,92 @@ class CarDetector:
         arrow_end = (x, y)
         cv2.arrowedLine(frame, center_int, arrow_end, (0, 255, 0), 2)
     
-        return center, angle, debug_frame
+        return center, angle
 
 
 
     def run(self):
+        
         if self.video_file:
-            corners, obstacles, scale_factor = self.load_video_data()
-            
-            has_saved = corners is not None and obstacles is not None and scale_factor is not None
-            if not corners:
-                print("No saved corners found. Select 4 corners.")
-                corners = self.select_corners(self.video_file)
+            is_saved = self.load_video_data()
+
+            if self.corners is None:
+                print("No saved corners.")
+                self.select_corners()
         else:
-            print("Using live feed. Select 4 corners.")
-            corners = self.select_corners()
+            print("Using live feed.")
+            self.select_corners()
         
-        self.start_detection(corners, scale_factor, obstacles, has_saved)
+        # if self.scale_factor is None:
+        #     print("No saved scale factor.")
+        #     self.calibrate_scale(200)
 
-    def continue_detection(self, corners, scale_factor, obstacles, history):
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("End of video")
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            warped = self.perspective_transform(frame, corners)
-            if warped is not None:
-        
-                history = self.detect_car(warped, scale_factor, obstacles, history)
+        if self.obstacles is None:
+            print("No saved obstacles.")
+            self.select_obstacles()
+
+        if self.finish_line is None:
+            print("No saved finsish line.")
+            self.select_finish_line()
     
-            if self.pressed('q'):
-                break
+        if not is_saved:
+            self.save_video_data()
 
-        self.cap.release()
-        cv2.destroyAllWindows()
+        self.start_detection()
 
-
-    def start_detection(self, corners, scale_factor, obstacles, has_saved):
+    def get_transformed_frame(self):
+        #ret, frame = self.cap.read()
+        frame = self.read_capture()
+        if frame is None:
+            return None
+        
+        warped = self.perspective_transform(frame)
+        return warped
+    
+    def start_detection(self):    
         frame_count = 0
+
         history = History()
         history.append(self.position, self.angle)
-        
+        start_time = time.time() ###
         while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            time_ = time.time() - start_time
+
+            frame = self.get_transformed_frame()
+            if frame is None:
                 break
-    
-            warped = self.perspective_transform(frame, corners)
-            if warped is not None:
-                if not scale_factor:
-                    print("No saved scale factor found.")
-                    scale_factor = self.calibrate_scale(200, corners)
-                #self.test_scale_factor(scale_factor, corners)
-                if obstacles is None:
-                    print("No saved obstacles found.")
-                    obstacles, obstacle_list = self.select_obstacles(corners)
-        
-                if obstacles is not None and scale_factor is not None:
-                    if not has_saved:
-                        self.save_video_data(corners, obstacle_list, scale_factor)
-                        has_saved = True
-
-                    history, has_crossed_finish = self.detect_car(warped, scale_factor, obstacles, history)
-
-                    
             
-                                        
+            position, angle = self.color_detection(frame, history)
+            history.append(position, angle)
+            self.position = position if position is not None else self.position
+            self.angle = angle if position is not None else self.angle
+            
+            if not self.started:
+                self.started = position is not None
+
+            
+            if not self.finished:
+                has_crossed_finish_line = self.crossed_finish_line(history)
+                if has_crossed_finish_line:
+                    valid_finish = history.valid_finish(frame_count, time_)
+                    if valid_finish is not None:
+                        self.finished = True                        
+
+                        self.save_finish_time(valid_finish)
+            
+            self.debug_detection(frame_count, time_)
+
+            frame_count += 1
+       
             if self.pressed('q'):
                 break
 
-            frame_count += 1
-
-        self.continue_detection(corners, scale_factor, obstacles, history)
-        #self.cap.release()
-        #cv2.destroyAllWindows()
+        #self.continue_detection(corners, scale_factor, obstacles, history)
+        # self.cap.release()
+        # cv2.destroyAllWindows()
 
 
-    def display_car_and_obstacles(self, car_frame, obstacles):
+    def debug_detection(self, frame_count, time_):
         if self.position is not None and self.angle is not None:
             n, e, s, w = self.get_distance_to_obstacles()
             x, y = map(int, self.position)
@@ -490,16 +562,40 @@ class CarDetector:
             
             for destination in distance_points:
                 destination = tuple(map(int, destination))
-                cv2.line(car_frame, (x, y), destination, (255, 0, 0), thickness=2)
+                cv2.line(self.debug_frame, (x, y), destination, (255, 0, 0), thickness=2)
 
-        for obstacle in obstacles:
+        for obstacle in self.obstacles:
                     for i in range(len(obstacle)):
                         pt1 = tuple(map(int, obstacle[i]))
                         pt2 = tuple(map(int, obstacle[(i+1) % len(obstacle)]))
-                        cv2.line(car_frame, pt1, pt2, (255, 0, 0), thickness=2)
+                        cv2.line(self.debug_frame, pt1, pt2, (255, 0, 0), thickness=2)
+
+        cv2.line(self.debug_frame, self.finish_line[0], self.finish_line[1], (200, 255, 0), 2)
+
+
+        for i in range(self.horizontal_squares):
+            x = self.pixels_per_square * (i+1) 
+            y = self.height
+            p1 = np.array([x,0])
+            p2 = np.array([x,y])
+            cv2.line(self.debug_frame, p1,p2, (10,10,10), 1)
+
+        for i in range(self.vertical_squares):
+            x = self.width
+            y = self.pixels_per_square * (i+1)
+            p1 = np.array([0,y])
+            p2 = np.array([x,y])
+            cv2.line(self.debug_frame, p1,p2, (10,10,10), 1)
+
+
+        
+        self.put_text(self.debug_frame, f"frame: {frame_count} time: {time_:.2f}")
+        
+        if self.finished:
+            self.put_text(self.debug_frame, f"finished at frame {frame_count} and time: ")
                 
 
-        cv2.imshow("Car and obstacles", car_frame)
+        cv2.imshow("Car and obstacles", self.debug_frame)
 
     def get_distance_to_obstacles(self, direction=None):
         corners = np.array([[0,0], [self.width,0], [self.width,self.height], [0,self.height]])
@@ -557,7 +653,7 @@ class CarDetector:
         return None
 
 
-    def detect_motion(self, frame, scale_factor, obstacles):
+    def detect_motion(self, frame, scale_factor, obstacles): ###
         mask = self.object_detector.apply(frame)
         cv2.imshow("Mask 1", mask)
         position, angle = None, None
@@ -586,52 +682,31 @@ class CarDetector:
         return position, angle, frame
     
 
-    def detect_car(self, frame, scale_factor, obstacles, finish_line, history):        
-        #self.detect_motion(frame, scale_factor, obstacles) # frame diff
-        
-        color_position, color_angle, color_frame = self.detect_color(frame, scale_factor, obstacles, history)
-        
-        #history validation
-        position = color_position
-        angle = color_angle
-
-        if position is not None and angle is not None:
-            self.position = position
-            self.angle = angle
-
-        history.append(position, angle)
-        
-        self.display_car_and_obstacles(color_frame, obstacles)
-
-        has_crossed_finish_line = self.crossed_finish_line(finish_line, history)
-
-        
-        return history, has_crossed_finish_line
+    def crossed_finish_line(self, history):
+        if history.get_latest_position() is None:
+            return False
+        current_pos = np.array(history.get_latest_position())
+        line_start, line_end = self.finish_line
+        line_vector = line_end - line_start
+        pos_vector = current_pos - line_start        
+        cross_product = np.cross(line_vector, pos_vector)
+        return cross_product < 0
     
-
-    def crossed_finish_line(self, finish_line, history):
-        pass
-        
-
-
-
-
-
-    def test_scale_factor(self, scale_factor, corners):
+    def test_scale_factor(self, scale_factor):
         while True:
-            ret, frame = self.cap.read()
-            warped = self.perspective_transform(frame, corners)
-            cv2.imshow("Test scale", warped)
+            frame = self.get_transformed_frame()
+
+            cv2.imshow("Test scale", frame)
             points = []
 
             def on_mouse(event, x, y, flags, param):
                 if event == cv2.EVENT_LBUTTONDOWN:
                     points.append((x, y))
-                    cv2.circle(warped, (x, y), 5, (0, 255, 0), -1)
-                    cv2.imshow("Test scale", warped)
+                    cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+                    cv2.imshow("Test scale", frame)
                     if len(points) == 2:
-                        cv2.line(warped, points[0], points[1], (255, 0, 0), 2)
-                        cv2.imshow("Test scale", warped)
+                        cv2.line(frame, points[0], points[1], (255, 0, 0), 2)
+                        cv2.imshow("Test scale", frame)
 
             cv2.setMouseCallback("Test scale", on_mouse)
             print("Select two points representing the real-world distance.")
@@ -644,11 +719,12 @@ class CarDetector:
             if len(points) == 2:
                 pixel_distance = np.linalg.norm(np.array(points[0]) - np.array(points[1]))            
                 real_distance_cm = pixel_distance / scale_factor
-                cv2.putText(warped, f"Distance: {real_distance_cm} cm", points[0],cv2.FONT_HERSHEY_SIMPLEX,0.5,(255, 0, 0),1,cv2.LINE_AA,)
+                cv2.putText(frame, f"Distance: {real_distance_cm} cm", points[0],cv2.FONT_HERSHEY_SIMPLEX,0.5,(255, 0, 0),1,cv2.LINE_AA,)
                 print(f'Distance {real_distance_cm}')
 
 
-
+    def save_finish_time(self, frame_count, time_):
+        pass
 
 
 
@@ -656,10 +732,15 @@ class History():
     def __init__(self) -> None:
         self.positions = []
         self.angles = []
+        self.finished = []
+
 
     def append(self, position, angle):
         self.positions.append(position)
         self.angles.append(angle)
+
+    def valid_finish(self, frame_count, time):
+        self.finished.append([frame_count, time])
 
     def get_latest_position(self):
         for position in reversed(self.positions):
@@ -690,8 +771,6 @@ if __name__ == "__main__":
     #detector = CarDetector("left.avi")
     #detector = CarDetector("obstacles1.avi")
     detector = CarDetector()
-
     detector.run()
-
 
 ###
